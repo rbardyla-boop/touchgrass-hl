@@ -27,6 +27,10 @@ class RateLimiter:
         self._seq = itertools.count()
         self._timer: asyncio.TimerHandle | None = None
         self._lock = asyncio.Lock()
+        self.http_429 = 0
+
+    def note_429(self) -> None:
+        self.http_429 += 1
 
     def used(self, now: float | None = None) -> int:
         self._expire(time.monotonic() if now is None else now)
@@ -41,10 +45,30 @@ class RateLimiter:
             "used": self.used(),
             "available": self.available(),
             "waiters": len(self.waiters),
+            "http_429": self.http_429,
         }
 
     def penalize(self, weight: int) -> None:
         self.events.append((time.monotonic(), max(1, int(weight))))
+
+    def refund(self, weight: int) -> None:
+        """Return unused reserved weight so a short page does not hold a full page."""
+        remaining = max(0, int(weight))
+        restored: list[tuple[float, int]] = []
+        while remaining > 0 and self.events:
+            ts, used = self.events.pop()
+            if used <= remaining:
+                remaining -= used
+            else:
+                restored.append((ts, used - remaining))
+                remaining = 0
+        for item in reversed(restored):
+            self.events.append(item)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(self._pump())
 
     async def acquire(self, weight: int, priority: int = PRIORITY_DISCOVERY) -> None:
         weight = max(1, int(weight))

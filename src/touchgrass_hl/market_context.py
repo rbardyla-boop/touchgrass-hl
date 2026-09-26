@@ -33,6 +33,9 @@ def enrich_packet(
     packet["sz_decimals"] = market.get("sz_decimals")
     packet["max_leverage"] = market.get("max_leverage")
     packet["growth_mode"] = market.get("growth_mode")
+    packet["deployer_fee_scale"] = market.get("deployer_fee_scale")
+    packet["last_fee_scale_change_ms"] = market.get("last_fee_scale_change_ms")
+    packet["collateral_token"] = market.get("collateral_token")
     packet["asset_id"] = market.get("asset_id")
     bbo = None
     spread = None
@@ -95,6 +98,9 @@ def market_dict(row) -> dict[str, Any]:
         "sz_decimals": row.sz_decimals,
         "max_leverage": row.max_leverage,
         "growth_mode": row.growth_mode,
+        "deployer_fee_scale": row.deployer_fee_scale,
+        "last_fee_scale_change_ms": row.last_fee_scale_change_ms,
+        "collateral_token": row.collateral_token,
         "status": row.status,
         "mark_px": row.mark_px,
         "oracle_px": row.oracle_px,

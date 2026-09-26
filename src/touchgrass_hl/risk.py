@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
 
@@ -26,6 +26,7 @@ class RiskConfig:
     fee_rate: Decimal
     fee_assumption: str
     cooldown_seconds: int = 900
+    supported_collateral: frozenset[int] = field(default_factory=lambda: frozenset({0}))
 
 
 def evaluate_risk(
@@ -92,6 +93,24 @@ def _evaluate(
 ) -> RiskResult:
     if account.kill_switch:
         vetoes.append("VETO_DRAWDOWN_KILL_SWITCH")
+    if account.marks_ok is False:
+        vetoes.append("VETO_STALE_OPEN_MARK")
+    if packet.get("fee_known") is False:
+        vetoes.append("VETO_UNKNOWN_FEE_SCALE")
+    if "collateral_token" in packet:
+        raw_token = packet.get("collateral_token")
+        dex = str(packet.get("dex") or "core")
+        if raw_token is None:
+            if dex not in ("", "core"):
+                vetoes.append("VETO_UNSUPPORTED_COLLATERAL")
+        else:
+            try:
+                token = int(raw_token)
+            except (TypeError, ValueError):
+                vetoes.append("VETO_UNSUPPORTED_COLLATERAL")
+            else:
+                if token not in cfg.supported_collateral:
+                    vetoes.append("VETO_UNSUPPORTED_COLLATERAL")
     if not ws_synced:
         vetoes.append("VETO_MARKET_DATA_UNSYNCHRONIZED")
     if context_time_ms is None or mark_px is None:

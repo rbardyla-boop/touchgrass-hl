@@ -100,6 +100,8 @@ def _pair_stats(
         "a_leads": a_leads,
         "b_leads": b_leads,
         "median_size_ratio": None if not ratios else format(median(ratios), "f"),
+        "eligible_events_a": len(a_events),
+        "eligible_events_b": len(b_events),
     }
 
 
@@ -132,6 +134,10 @@ def build_groups(
         for wb in eligible[i + 1 :]:
             jacc = _jaccard(sets[wa], sets[wb])
             stats = _pair_stats(by_wallet[wa], by_wallet[wb], cfg.proximity_ms)
+            pair_events = min(stats["eligible_events_a"], stats["eligible_events_b"])
+            fraction = (
+                Decimal(stats["simultaneous"]) / Decimal(pair_events) if pair_events else Decimal(0)
+            )
             if jacc >= cfg.jaccard_min and stats["simultaneous"] >= cfg.min_simultaneous:
                 uf.union(wa, wb)
                 edges.append(
@@ -140,9 +146,14 @@ def build_groups(
                         "b": wb,
                         "jaccard": format(jacc, "f"),
                         "simultaneous": stats["simultaneous"],
+                        "near_simultaneous": stats["simultaneous"],
+                        "near_simultaneous_fraction": format(fraction, "f"),
+                        "eligible_events_a": stats["eligible_events_a"],
+                        "eligible_events_b": stats["eligible_events_b"],
                         "a_leads": stats["a_leads"],
                         "b_leads": stats["b_leads"],
                         "median_size_ratio": stats["median_size_ratio"],
+                        "link": "direct",
                         "rule": "jaccard_and_repeated_near_simultaneous_entries",
                         "relationship_type": "behavioral_group",
                         "ownership_claim": False,
@@ -170,6 +181,8 @@ def build_groups(
                 "relationship_type": "behavioral_group",
                 "ownership_claim": False,
                 "edges": related,
+                "grouping": "singleton",
+                "transitive_pairs": [],
                 "why": (
                     "merged on Jaccard overlap of (market, direction) plus repeated "
                     "near-simultaneous same-direction entries"
@@ -178,6 +191,31 @@ def build_groups(
                 ),
             }
         )
+    direct = {(edge["a"], edge["b"]) for edge in edges}
+    direct |= {(b, a) for a, b in list(direct)}
+    for record in records:
+        members = record["members"]
+        transitive = []
+        for i, left in enumerate(members):
+            for right in members[i + 1 :]:
+                if (left, right) not in direct:
+                    transitive.append(
+                        {
+                            "a": left,
+                            "b": right,
+                            "link": "transitive",
+                            "direct": False,
+                            "ownership_claim": False,
+                            "why": "union-find via other direct pairs; not a direct A-C relationship",
+                        }
+                    )
+        record["transitive_pairs"] = transitive
+        if len(members) == 1:
+            record["grouping"] = "singleton"
+        elif transitive:
+            record["grouping"] = "transitive_union"
+        else:
+            record["grouping"] = "direct"
     return {
         "group_of": group_of,
         "groups": records,

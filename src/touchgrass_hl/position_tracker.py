@@ -94,7 +94,7 @@ def _empty_episode(fill: FillRecord, direction: str, size: Decimal) -> Episode:
         entry_price=fill.price,
         exit_price=None,
         entry_size=size,
-        closed_pnl=Decimal(0),
+        closed_pnl=fill.closed_pnl,
         fees=fill.fee,
         entry_notional=fill.price * size,
         closed=False,
@@ -111,6 +111,7 @@ def _add_entry(ep: Episode, fill: FillRecord, add_size: Decimal) -> None:
         ep.entry_price = notional / ep.entry_size
         ep.entry_notional = ep.entry_price * ep.entry_size
     ep.fees += fill.fee
+    ep.closed_pnl += fill.closed_pnl
     ep.fill_count += 1
     if fill.crossed is True:
         ep.taker_fills += 1
@@ -118,36 +119,58 @@ def _add_entry(ep: Episode, fill: FillRecord, add_size: Decimal) -> None:
         ep.maker_fills += 1
 
 
-def _close_episode(ep: Episode, fill: FillRecord, exit_size: Decimal) -> None:
-    prev_exit_notional = Decimal(0) if ep.exit_price is None else ep.exit_price * (
-        ep.entry_size if ep.closed else Decimal(0)
-    )
-    # Track exit VWAP on the size that actually leaves.
-    already = Decimal(0)
-    if ep.exit_price is not None and ep.exit_time_ms is not None and not ep.closed:
-        # exit_price holds VWAP of size reduced so far; recover via a side field
-        already = getattr(ep, "_exit_size", Decimal(0))
+def _note_exit(ep: Episode, fill: FillRecord, exit_size: Decimal) -> None:
+    already = getattr(ep, "_exit_size", Decimal(0))
     new_size = already + exit_size
     new_notional = (ep.exit_price or Decimal(0)) * already + fill.price * exit_size
     ep.exit_price = new_notional / new_size if new_size > 0 else fill.price
     setattr(ep, "_exit_size", new_size)
     ep.exit_time_ms = fill.time_ms
-    ep.closed_pnl += fill.closed_pnl
-    ep.fees += fill.fee
+
+
+def _account_fill(ep: Episode, fill: FillRecord, pnl: Decimal, fee: Decimal, exit_size: Decimal | None) -> None:
+    """Add one fill's closedPnl exactly once. Exit VWAP is optional."""
+    if exit_size is not None:
+        _note_exit(ep, fill, exit_size)
+    ep.closed_pnl += pnl
+    ep.fees += fee
     ep.fill_count += 1
     if fill.crossed is True:
         ep.taker_fills += 1
     elif fill.crossed is False:
         ep.maker_fills += 1
-    _ = prev_exit_notional
+
+
+def allocate_flip(fill: FillRecord, closed_size: Decimal, opened_size: Decimal) -> tuple[Decimal, Decimal, Decimal, Decimal]:
+    """Split one flip fill so the two legs sum to that fill's closedPnl and fee.
+
+    Hyperliquid puts the fee inside closedPnl. The newly opened size is charged
+    its share of the fee (a positive fee is a negative closedPnl, matching an
+    opening fill). The closing leg keeps the rest, which is price PnL plus the
+    closing share of the fee.
+    """
+    total = closed_size + opened_size
+    if total <= 0:
+        return fill.closed_pnl, Decimal(0), fill.fee, Decimal(0)
+    open_fee = fill.fee * (opened_size / total)
+    close_fee = fill.fee - open_fee
+    open_pnl = -open_fee
+    close_pnl = fill.closed_pnl - open_pnl
+    return close_pnl, open_pnl, close_fee, open_fee
+
+
+def _close_episode(ep: Episode, fill: FillRecord, exit_size: Decimal) -> None:
+    _account_fill(ep, fill, fill.closed_pnl, fill.fee, exit_size)
 
 
 def reconstruct(fills: list[FillRecord]) -> tuple[list[Episode], list[ClassifiedAction], int]:
     """Rebuild closed and open episodes from fills sorted per market.
 
     Returns episodes (open and closed), classified actions, and unmatched close count.
-    Realized episode PnL is the sum of Hyperliquid closedPnl on the fills inside
-    the episode, not a price-direction guess.
+    Realized episode PnL is the sum of Hyperliquid closedPnl on every fill
+    attached to the episode, including opens and adds. An opening fill's
+    closedPnl is the fee. A closing fill's closedPnl is the fee plus realized
+    price PnL. Each fill is applied once.
     """
     grouped: dict[str, list[FillRecord]] = {}
     for fill in fills:
@@ -200,16 +223,17 @@ def reconstruct(fills: list[FillRecord]) -> tuple[list[Episode], list[Classified
                     current = None
                     continue
                 closed_size = abs(prev)
+                opened = abs(new)
+                close_pnl, open_pnl, close_fee, open_fee = allocate_flip(fill, closed_size, opened)
                 if current is not None and not current.closed:
-                    _close_episode(current, fill, closed_size)
+                    _account_fill(current, fill, close_pnl, close_fee, closed_size)
                     current.closed = True
                 else:
                     unmatched += 1
-                opened = abs(new)
                 direction = "SHORT" if action == "FLIP_LONG_TO_SHORT" else "LONG"
                 nxt = _empty_episode(fill, direction, opened)
-                nxt.closed_pnl = Decimal(0)
-                nxt.fees = Decimal(0)
+                nxt.closed_pnl = open_pnl
+                nxt.fees = open_fee
                 episodes.append(nxt)
                 current = nxt
             elif action in {"CLOSE_LONG", "CLOSE_SHORT", "REDUCE_LONG", "REDUCE_SHORT"}:

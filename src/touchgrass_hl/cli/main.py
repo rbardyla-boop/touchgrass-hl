@@ -12,7 +12,7 @@ from sqlalchemy import func, select
 
 from touchgrass_hl import __version__
 from touchgrass_hl.config import Settings
-from touchgrass_hl.db.repo import count_rows, ensure_paper_accounts, load_account
+from touchgrass_hl.db.repo import count_rows, ensure_paper_accounts, load_account, research_summary
 from touchgrass_hl.db.schema import (
     AuditEventRow,
     CandidateRow,
@@ -118,9 +118,11 @@ def cmd_doctor(settings: Settings, _args) -> int:
         factory = session_factory(engine)
         with session_scope(factory) as session:
             ensure_paper_accounts(session, settings.paper_starting_equity)
+            summary = research_summary(session)
         engine.dispose()
     except Exception as exc:
         checks.append(("database", "FAIL", str(exc)[:300]))
+        summary = None
     try:
         count = asyncio.run(_doctor_markets(settings))
         checks.append(("hyperliquid_mainnet_info", "PASS", f"markets={count}"))
@@ -157,6 +159,8 @@ def cmd_doctor(settings: Settings, _args) -> int:
         print(f"[{status}] {name}: {detail}")
         if status == "FAIL":
             failed = True
+    if summary is not None:
+        print("research=" + json.dumps(summary, sort_keys=True))
     return 1 if failed else 0
 
 
@@ -227,6 +231,9 @@ def cmd_discover(settings: Settings, _args) -> int:
                 f"{str(row.mark_px or ''):>14} {str(row.day_ntl_vlm or ''):>16} {row.market_id}"
             )
     print(f"markets={count}")
+    with session_scope(factory) as session:
+        ensure_paper_accounts(session, settings.paper_starting_equity)
+        print("research=" + json.dumps(research_summary(session), sort_keys=True))
     engine.dispose()
     return 0
 

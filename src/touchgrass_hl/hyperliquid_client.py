@@ -207,6 +207,15 @@ def user_fills_by_time_weight(n_items: int) -> tuple[int, int]:
     return 20, extra
 
 
+USER_FILLS_PAGE_CAP = 2000
+
+
+def user_fills_reserve(page_cap: int = USER_FILLS_PAGE_CAP) -> int:
+    """Worst-case weight of one userFillsByTime page, reserved before the request."""
+    base, extra = user_fills_by_time_weight(page_cap)
+    return base + extra
+
+
 class HyperliquidREST:
     """Rate-limited official info endpoint. Public data only."""
 
@@ -238,6 +247,7 @@ class HyperliquidREST:
         except Exception as exc:
             text = str(exc)
             if "429" in text or "rate" in text.lower():
+                self.limiter.note_429()
                 self.limiter.penalize(self.limiter.capacity)
             raise
 
@@ -268,12 +278,25 @@ class HyperliquidREST:
         }
         if end_ms is not None:
             payload["endTime"] = end_ms
-        # Docs: weight 20 plus 1 per 20 returned items. The page size is unknown
-        # until the response arrives, so the extra is recorded immediately after.
-        result = await self.info(payload, user_fills_by_time_weight(0)[0], priority)
-        extra = user_fills_by_time_weight(len(result) if isinstance(result, list) else 0)[1]
-        if extra:
-            self.limiter.penalize(extra)
+        # Reserve a full 2,000-fill page (weight 120) before the request so the
+        # local budget cannot be exceeded when the page comes back full. Refund
+        # the unused part after the response. A 429 keeps the reservation.
+        reserve = min(user_fills_reserve(), self.limiter.capacity)
+        await self.limiter.acquire(reserve, priority)
+        import asyncio
+
+        try:
+            result = await asyncio.to_thread(self.post_info, payload, reserve, priority)
+        except Exception as exc:
+            text = str(exc)
+            if "429" in text or "rate" in text.lower():
+                self.limiter.note_429()
+                self.limiter.penalize(self.limiter.capacity)
+            raise
+        n_items = len(result) if isinstance(result, list) else 0
+        actual = sum(user_fills_by_time_weight(n_items))
+        if reserve > actual:
+            self.limiter.refund(reserve - actual)
         return result
 
     async def portfolio(self, address: str, priority: int = 3) -> Any:

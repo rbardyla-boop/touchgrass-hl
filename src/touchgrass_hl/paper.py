@@ -38,6 +38,8 @@ class PaperPosition:
     funding_pnl: Decimal | None = None
     entry_slippage_bps: Decimal | None = None
     exit_slippage_bps: Decimal | None = None
+    fee_inputs: dict | None = None
+    exit_fee_inputs: dict | None = None
 
 
 @dataclass
@@ -79,6 +81,27 @@ def _price_pnl(direction: str, entry: Decimal, exit_px: Decimal, size: Decimal) 
     if direction == "LONG":
         return (exit_px - entry) * size
     return (entry - exit_px) * size
+
+
+def marked_account(
+    account: AccountState,
+    marks: dict[str, Decimal],
+    marks_ok: bool,
+) -> tuple[Decimal, Decimal, Decimal]:
+    """Marked equity, peak, and free cash.
+
+    Free cash is settled cash plus unrealized PnL. Locked entry notional is not
+    spendable. Peak equity moves only when every open mark is fresh. A missing
+    mark does not invent a flat position: free cash is reported as zero so a
+    new entry cannot use a stale book, and the caller must fail closed.
+    """
+    locked = sum((pos.entry_notional for pos in account.open_positions()), Decimal(0))
+    if not marks_ok:
+        return account.equity({}), account.peak_equity, Decimal(0)
+    equity = account.equity(marks)
+    if equity > account.peak_equity:
+        account.peak_equity = equity
+    return equity, account.peak_equity, equity - locked
 
 
 def funding_pnl(direction: str, notional: Decimal, funding_rate: Decimal, hold_seconds: int) -> Decimal:
@@ -208,6 +231,7 @@ def close_from_book(
     now_ms: int,
     fee_rate: Decimal,
     fee_assumption: str,
+    fee_inputs: dict | None = None,
 ) -> PaperPosition | None:
     if pos.status != "open":
         return None
@@ -223,6 +247,7 @@ def close_from_book(
     pos.exit_px = walked.vwap
     pos.exit_fee = exit_fee
     pos.exit_fee_assumption = fee_assumption
+    pos.exit_fee_inputs = fee_inputs
     pos.exit_reason = reason
     pos.closed_ms = now_ms
     pos.funding_pnl = fund

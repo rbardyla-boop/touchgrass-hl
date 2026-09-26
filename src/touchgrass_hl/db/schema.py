@@ -28,6 +28,9 @@ class MarketRow(Base):
     margin_mode: Mapped[str | None] = mapped_column(String(32), nullable=True)
     only_isolated: Mapped[bool] = mapped_column(Boolean, default=False)
     growth_mode: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    deployer_fee_scale: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    last_fee_scale_change_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    collateral_token: Mapped[int | None] = mapped_column(Integer, nullable=True)
     is_delisted: Mapped[bool] = mapped_column(Boolean, default=False)
     mark_px: Mapped[str | None] = mapped_column(String(64), nullable=True)
     oracle_px: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -78,6 +81,9 @@ class WalletRow(Base):
     completeness_label: Mapped[str] = mapped_column(String(80), default="unknown")
     lifetime_complete: Mapped[bool] = mapped_column(Boolean, default=False)
     verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    performance_verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    verification_stage: Mapped[str] = mapped_column(String(16), default="none")
+    copy_observations: Mapped[int] = mapped_column(Integer, default=0)
     tracked: Mapped[bool] = mapped_column(Boolean, default=False)
     updated_ms: Mapped[int] = mapped_column(BigInteger, default=0)
 
@@ -112,7 +118,8 @@ class WalletFillRow(Base):
     hash: Mapped[str] = mapped_column(String(80), default="")
     crossed: Mapped[int | None] = mapped_column(Integer, nullable=True)  # 1 taker, 0 maker, null unknown
     raw_json: Mapped[str] = mapped_column(Text, default="")
-    __table_args__ = (UniqueConstraint("address", "tid", name="uq_wallet_fill"),)
+    fill_key: Mapped[str] = mapped_column(String(220), default="")
+    __table_args__ = (UniqueConstraint("address", "fill_key", name="uq_wallet_fill_key"),)
 
 
 class EpisodeRow(Base):
@@ -311,6 +318,7 @@ class PaperFillRow(Base):
     slippage_bps: Mapped[str | None] = mapped_column(String(32), nullable=True)
     time_ms: Mapped[int] = mapped_column(BigInteger)
     book_json: Mapped[str] = mapped_column(Text, default="")
+    fee_inputs_json: Mapped[str] = mapped_column(Text, default="")
 
 
 class TestnetOrderRow(Base):

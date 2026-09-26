@@ -149,7 +149,12 @@ class Metrics:
     completeness_label: str
     copyability: Decimal | None
     copyability_known: bool
+    copyability_observations: int
     unmatched_closes: int
+    normalized_return: Decimal
+    reconstructed_net_pnl: Decimal
+    pnl_reconciled: bool
+    data_quality_degraded: bool
 
 
 @dataclass
@@ -159,6 +164,10 @@ class ScoreBreakdown:
     omitted: list[str]
     verified: bool
     verification_reasons: list[str]
+    performance_verified: bool = False
+    copy_verified: bool = False
+    verification_stage: str = "none"
+    copy_reasons: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -186,6 +195,7 @@ class AccountView:
     peak_equity: Decimal
     free_cash: Decimal
     kill_switch: bool
+    marks_ok: bool = True
 
 
 @dataclass

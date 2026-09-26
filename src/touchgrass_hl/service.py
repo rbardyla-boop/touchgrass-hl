@@ -14,31 +14,37 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from touchgrass_hl.audit import append_audit
+from touchgrass_hl.baseline_queue import plan_baseline_batch
 from touchgrass_hl.cluster_detector import ClusterConfig, ClusterDetector
 from touchgrass_hl.collector import TradeCollector
 from touchgrass_hl.config import Settings, score_weights
 from touchgrass_hl.db.repo import (
     add_open_position,
+    baseline_priority,
     behavior_events,
     count_rows,
     current_group_map,
     ensure_paper_accounts,
     finish_hydration,
+    get_checkpoint,
     insert_action,
     insert_candidate,
     insert_context,
     insert_jev,
     insert_lane,
     insert_risk,
+    known_copyability_observations,
     lane_exists,
     latest_scores,
     load_account,
     load_wallet_fills,
     mark_position_closed,
+    monitored_addresses,
     prune,
     recent_same_signal,
     replace_current_groups,
     replace_episodes,
+    research_summary,
     reset_running_jobs,
     save_account,
     save_score,
@@ -67,6 +73,7 @@ from touchgrass_hl.paper import (
     close_from_book,
     decide_lane_acceptance,
     exit_reason,
+    marked_account,
 )
 from touchgrass_hl.position_tracker import OPEN_ADD, reconstruct
 from touchgrass_hl.rate_limit import PRIORITY_CANDIDATE, RateLimiter
@@ -121,6 +128,7 @@ class ResearchService:
             timeout_s=settings.jev_timeout_s,
         )
         self.verified: set[str] = set()
+        self.monitored: set[str] = set()
         self.groups: dict[str, str] = {}
         self.scores: dict[str, Decimal] = {}
         self.hydrations_this_hour = 0
@@ -134,6 +142,7 @@ class ResearchService:
                 reset_running_jobs(session)
                 ensure_paper_accounts(session, self.settings.paper_starting_equity)
                 self.verified = verified_addresses(session)
+                self.monitored = monitored_addresses(session)
                 self.groups = current_group_map(session)
                 self.scores = latest_scores(session)
                 restored = self.registry.load_cached(session)
@@ -203,6 +212,7 @@ class ResearchService:
                 break
             with self.state_lock:
                 verified = set(self.verified)
+                monitored = set(self.monitored)
                 groups = dict(self.groups)
                 scores = dict(self.scores)
             if not self.collector.buffer and not self.collector.ctx_updates:
@@ -211,7 +221,11 @@ class ResearchService:
                 with self.db_lock:
                     with session_scope(self.factory) as session:
                         candidates = self.collector.flush(
-                            session, verified=verified, groups=groups, scores=scores
+                            session,
+                            verified=verified,
+                            groups=groups,
+                            scores=scores,
+                            monitored=monitored,
                         )
             except Exception:
                 logger.exception("flush_failed")
@@ -252,9 +266,20 @@ class ResearchService:
     async def _decide(self, packet: dict[str, Any], book: Book | None) -> None:
         settings = self.settings
         dex = str(packet.get("dex") or "core")
-        fee_rate, fee_assumption = settings.fee_for(
-            dex=dex, growth_mode=packet.get("growth_mode"), role="taker"
+        fee_rate, fee_assumption, fee_inputs = settings.fee_for(
+            dex=dex,
+            growth_mode=packet.get("growth_mode"),
+            role="taker",
+            deployer_fee_scale=packet.get("deployer_fee_scale"),
+            aligned_quote=False,
         )
+        packet["fee_snapshot"] = fee_inputs
+        packet["fee_known"] = fee_rate is not None
+        if fee_rate is None:
+            fee_rate = Decimal(0)
+        clone = dict(packet)
+        clone.pop("packet_hash", None)
+        packet["packet_hash"] = canon_hash(clone)
         neutral = AccountView(
             open_positions=0,
             open_markets={},
@@ -355,6 +380,7 @@ class ResearchService:
             fee_rate=fee_rate,
             fee_assumption=fee_assumption,
             cooldown_seconds=s.signal_cooldown_seconds,
+            supported_collateral=s.supported_collateral(),
         )
 
     def _decide_lane(
@@ -376,15 +402,33 @@ class ResearchService:
         since = now - self.settings.signal_cooldown_seconds * 1000
         recent = recent_same_signal(session, packet["market_id"], packet["direction"], since, lane)
         opens = account.open_positions()
+        marks: dict[str, Decimal] = {}
+        marks_ok = True
+        stale_ms = self.settings.stale_market_seconds * 1000
+        for pos in opens:
+            market = session.get(MarketRow, pos.market_id)
+            fresh = (
+                market is not None
+                and market.mark_px not in (None, "")
+                and now - int(market.updated_ms or 0) <= stale_ms
+            )
+            if not fresh:
+                marks_ok = False
+                continue
+            marks[pos.market_id] = D(str(market.mark_px))
+        equity, peak, free_cash = marked_account(account, marks, marks_ok)
+        if marks_ok:
+            save_account(session, account)
         view = AccountView(
             open_positions=len(opens),
             open_markets={p.market_id: p.direction for p in opens},
             recent_same_direction=recent,
             daily_realized_pnl=account.day_realized,
-            equity=account.equity({}),
-            peak_equity=account.peak_equity,
-            free_cash=account.free_cash(),
+            equity=equity,
+            peak_equity=peak,
+            free_cash=free_cash,
             kill_switch=self.kill_switch_active(),
+            marks_ok=marks_ok,
         )
         cfg = self._risk_cfg(fee_rate, fee_assumption, int(packet.get("sz_decimals") or 0))
         ws_ok = self.ws.synced and (
@@ -444,6 +488,7 @@ class ResearchService:
                 funding_rate=maybe_d(packet.get("funding")) or Decimal(0),
                 opened_ms=now,
                 entry_slippage_bps=risk.slippage_bps,
+                fee_inputs=packet.get("fee_snapshot"),
             )
             # Lock notional inside apply by mutating a loaded account.
             if account.cash < pos.entry_notional + pos.entry_fee:
@@ -526,7 +571,14 @@ class ResearchService:
                             )
                 log(logger, logging.INFO, "hydration_done", address=address, fills=len(result["fills"]), label=result["label"])
             except Exception as exc:
-                log(logger, logging.WARNING, "hydration_failed", address=address, error=str(exc)[:300])
+                text = str(exc)
+                log(logger, logging.WARNING, "hydration_failed", address=address, error=text[:300])
+                if "429" in text:
+                    try:
+                        await asyncio.wait_for(stop.wait(), timeout=60)
+                        break
+                    except asyncio.TimeoutError:
+                        log(logger, logging.INFO, "hydration_backoff_elapsed", address=address)
                 with self.db_lock:
                     with session_scope(self.factory) as session:
                         finish_hydration(
@@ -628,14 +680,16 @@ class ResearchService:
                         [ep for ep in episodes if ep.closed][:50],
                         self.settings.copy_delay_list(),
                     )
+                    observations = known_copyability_observations(session, address)
                     metrics = compute_metrics(
                         episodes,
                         records,
                         copyability=copy_value,
                         completeness_label=label,
                         requested_window_fully_returned=window_complete,
+                        copyability_observations=observations,
+                        unmatched_closes=unmatched,
                     )
-                    metrics.unmatched_closes = unmatched
                     built.append((address, metrics))
                     metrics_json[address] = dumps(metrics_to_dict(metrics))
         if not built:
@@ -647,27 +701,37 @@ class ResearchService:
             min_active_days=self.settings.min_active_days,
             max_profit_concentration=self.settings.max_profit_concentration,
             allow_concentration_override=self.settings.allow_profit_concentration_override,
+            min_copyability_observations=self.settings.min_copyability_observations,
         )
+        metrics_by = dict(built)
         now = utc_now_ms()
         with self.db_lock:
             with session_scope(self.factory) as session:
                 for address, breakdown in scored.items():
+                    stage = breakdown.verification_stage
                     save_score(
                         session,
                         address,
                         metrics_json[address],
                         format(breakdown.score, "f"),
-                        breakdown.verified,
+                        breakdown.copy_verified,
                         dumps(
                             {
                                 "score": format(breakdown.score, "f"),
                                 "components": breakdown.components,
                                 "omitted": breakdown.omitted,
                                 "verified": breakdown.verified,
+                                "performance_verified": breakdown.performance_verified,
+                                "copy_verified": breakdown.copy_verified,
+                                "verification_stage": stage,
                                 "verification_reasons": breakdown.verification_reasons,
+                                "copy_reasons": breakdown.copy_reasons,
                             }
                         ),
                         now,
+                        performance_verified=breakdown.performance_verified,
+                        verification_stage=stage,
+                        copy_observations=metrics_by[address].copyability_observations,
                     )
                 since = now - self.settings.independence_window_days * 86_400_000
                 events = []
@@ -695,15 +759,55 @@ class ResearchService:
                 )
                 replace_current_groups(session, grouped["groups"], now)
                 verified = verified_addresses(session)
+                monitored = monitored_addresses(session)
                 groups = current_group_map(session)
                 scores = latest_scores(session)
-                set_checkpoint(session, "scoring", {"ms": now, "wallets": len(scored), "verified": len(verified)})
+                set_checkpoint(
+                    session,
+                    "scoring",
+                    {
+                        "ms": now,
+                        "wallets": len(scored),
+                        "performance_verified": sum(
+                            1 for item in scored.values() if item.performance_verified
+                        ),
+                        "copy_verified": len(verified),
+                    },
+                )
         with self.state_lock:
             self.verified = verified
+            self.monitored = monitored
             self.groups = groups
             self.scores = scores
-        log(logger, logging.INFO, "scoring_complete", wallets=len(scored), verified=len(verified))
-        await self._refresh_baselines(list(verified)[: self.settings.verified_baseline_batch])
+        log(
+            logger,
+            logging.INFO,
+            "scoring_complete",
+            wallets=len(scored),
+            performance=sum(1 for item in scored.values() if item.performance_verified),
+            copy_verified=len(verified),
+        )
+        await self._refresh_baselines_rotating()
+
+    async def _refresh_baselines_rotating(self) -> None:
+        with self.db_lock:
+            with session_scope(self.factory) as session:
+                addresses = sorted(verified_addresses(session))
+                cursor_row = get_checkpoint(session, "baseline_cursor") or {}
+                cursor = int(cursor_row.get("cursor") or 0)
+                priority = baseline_priority(session, addresses, utc_now_ms())
+                batch, new_cursor = plan_baseline_batch(
+                    addresses,
+                    cursor=cursor,
+                    batch=self.settings.verified_baseline_batch,
+                    priority=priority,
+                )
+                set_checkpoint(
+                    session,
+                    "baseline_cursor",
+                    {"cursor": new_cursor, "last_batch": batch, "ms": utc_now_ms()},
+                )
+        await self._refresh_baselines(batch)
 
     async def _refresh_baselines(self, addresses: list[str]) -> None:
         dexes = list(self.registry.order.keys()) or [""]
@@ -753,8 +857,22 @@ class ResearchService:
                 open_rows = []
                 for lane in LANES:
                     account = load_account(session, lane)
-                    for pos in account.open_positions():
+                    opens = account.open_positions()
+                    marks: dict[str, Decimal] = {}
+                    marks_ok = True
+                    stale_ms = self.settings.stale_market_seconds * 1000
+                    now = utc_now_ms()
+                    for pos in opens:
                         market = session.get(MarketRow, pos.market_id)
+                        fresh = (
+                            market is not None
+                            and market.mark_px not in (None, "")
+                            and now - int(market.updated_ms or 0) <= stale_ms
+                        )
+                        if not fresh:
+                            marks_ok = False
+                        elif market is not None and market.mark_px is not None:
+                            marks[pos.market_id] = D(str(market.mark_px))
                         if market is None:
                             continue
                         open_rows.append(
@@ -765,8 +883,12 @@ class ResearchService:
                                 "updated_ms": market.updated_ms,
                                 "dex": market.dex,
                                 "growth_mode": market.growth_mode,
+                                "deployer_fee_scale": market.deployer_fee_scale,
                             }
                         )
+                    if opens and marks_ok:
+                        marked_account(account, marks, True)
+                        save_account(session, account)
         for item in open_rows:
             pos = item["pos"]
             if item["mark"] is None:
@@ -793,9 +915,22 @@ class ResearchService:
             if book is None:
                 log(logger, logging.INFO, "exit_deferred_missing_book", lane=item["lane"], market=pos.market_id, reason=reason)
                 continue
-            fee_rate, fee_assumption = self.settings.fee_for(
-                dex=item["dex"], growth_mode=item["growth_mode"], role="taker"
+            fee_rate, fee_assumption, fee_inputs = self.settings.fee_for(
+                dex=item["dex"],
+                growth_mode=item["growth_mode"],
+                role="taker",
+                deployer_fee_scale=item.get("deployer_fee_scale"),
+                aligned_quote=False,
             )
+            if fee_rate is None:
+                log(
+                    logger,
+                    logging.INFO,
+                    "exit_deferred_unknown_fee",
+                    lane=item["lane"],
+                    market=pos.market_id,
+                )
+                continue
             with self.db_lock:
                 with session_scope(self.factory) as session:
                     account = load_account(session, item["lane"])
@@ -810,6 +945,7 @@ class ResearchService:
                         now_ms=utc_now_ms(),
                         fee_rate=fee_rate,
                         fee_assumption=fee_assumption,
+                        fee_inputs=fee_inputs,
                     )
                     if closed is None:
                         log(logger, logging.INFO, "exit_deferred_book_walk", lane=item["lane"], market=pos.market_id)
@@ -884,6 +1020,7 @@ class ResearchService:
             wallets=wallets,
             candidates=self.candidates_seen,
             verified=len(self.verified),
+            monitored=len(self.monitored),
             rate=self.limiter.snapshot(),
         )
 
@@ -895,20 +1032,14 @@ class ResearchService:
     def snapshot(self) -> dict[str, Any]:
         with self.db_lock:
             with session_scope(self.factory) as session:
-                wallets = count_rows(session, WalletRow)
-                from touchgrass_hl.db.schema import TradeRow
-
-                trades = count_rows(session, TradeRow)
-                markets = count_rows(session, MarketRow)
-        return {
-            "markets": markets,
-            "trades": trades,
-            "wallets": wallets,
-            "ws_messages": self.ws.messages,
-            "ws_connects": self.ws.connects,
-            "trades_inserted": self.collector.inserted,
-            "candidates": self.candidates_seen,
-        }
+                summary = research_summary(session)
+        summary["ws_messages"] = self.ws.messages
+        summary["ws_connects"] = self.ws.connects
+        summary["trades_inserted"] = self.collector.inserted
+        summary["http_429"] = self.limiter.http_429
+        summary["copy_verified_loaded"] = len(self.verified)
+        summary["monitored_loaded"] = len(self.monitored)
+        return summary
 
 
 def _install_signals(stop: asyncio.Event) -> None:
@@ -955,11 +1086,18 @@ async def run_service(settings: Settings, duration_s: float | None = None) -> di
     # Final flush.
     with service.state_lock:
         verified = set(service.verified)
+        monitored = set(service.monitored)
         groups = dict(service.groups)
         scores = dict(service.scores)
     with service.db_lock:
         with session_scope(service.factory) as session:
-            service.collector.flush(session, verified=verified, groups=groups, scores=scores)
+            service.collector.flush(
+                session,
+                verified=verified,
+                groups=groups,
+                scores=scores,
+                monitored=monitored,
+            )
     stats = service.snapshot()
     with service.db_lock:
         with session_scope(service.factory) as session:

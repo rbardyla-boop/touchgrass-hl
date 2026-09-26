@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -13,6 +13,80 @@ from touchgrass_hl.util import D
 TESTNET_API_URL = "https://api.hyperliquid-testnet.xyz"
 MAINNET_API_URL = "https://api.hyperliquid.xyz"
 MAINNET_WS_URL = "wss://api.hyperliquid.xyz/ws"
+
+
+def official_perp_fee(
+    *,
+    base_rate: Decimal,
+    role: str,
+    deployer_fee_scale: Decimal | None,
+    growth_mode: bool,
+    referral_discount: Decimal = Decimal(0),
+    aligned_quote: bool = False,
+    hip3: bool = False,
+) -> tuple[Decimal | None, dict[str, Any]]:
+    """Official HIP-3 fee as a fraction, not a percent.
+
+    scaleIfHip3 = scale+1 when scale < 1, else scale*2.
+    growthModeScale = 0.1 when growth mode is enabled, else 1.
+    Core markets use scaleIfHip3 = 1 and deployer share 0.
+    A missing HIP-3 deployerFeeScale is unknown and must not be invented.
+    Aligned quote collateral is applied only when the caller says it is aligned.
+    Paper defaults that flag to false.
+    """
+    growth = Decimal("0.1") if growth_mode else Decimal(1)
+    if not hip3:
+        scale_if = Decimal(1)
+        share = Decimal(0)
+        scale_value = None
+    elif deployer_fee_scale is None:
+        return None, {
+            "known": False,
+            "hip3": True,
+            "role": role,
+            "reason": "missing_deployer_fee_scale",
+        }
+    else:
+        scale_value = D(deployer_fee_scale)
+        if scale_value < 1:
+            scale_if = scale_value + Decimal(1)
+            share = scale_value / (Decimal(1) + scale_value)
+        else:
+            scale_if = scale_value * Decimal(2)
+            share = Decimal("0.5")
+    referral = Decimal(1) - D(referral_discount)
+    if role == "taker":
+        rate = D(base_rate) * scale_if * growth * referral
+        if aligned_quote:
+            rate *= (Decimal(1) - share) * Decimal("0.8") + share
+    else:
+        preliminary = D(base_rate) * growth
+        if preliminary > 0:
+            rate = preliminary * scale_if * referral
+        else:
+            rebate = ((Decimal(1) - share) * Decimal("1.5") + share) if aligned_quote else Decimal(1)
+            rate = preliminary * rebate
+    inputs: dict[str, Any] = {
+        "known": True,
+        "role": role,
+        "base_rate": format(D(base_rate), "f"),
+        "deployer_fee_scale": None if scale_value is None else format(scale_value, "f"),
+        "scale_if_hip3": format(scale_if, "f"),
+        "deployer_share": format(share, "f"),
+        "growth_mode": bool(growth_mode),
+        "growth_mode_scale": format(growth, "f"),
+        "referral_discount": format(D(referral_discount), "f"),
+        "aligned_quote": bool(aligned_quote),
+        "hip3": bool(hip3),
+        "rate": format(rate, "f"),
+        "formula": (
+            "taker: base * scaleIfHip3 * growthModeScale * (1-referral) "
+            "* aligned((1-share)*0.8+share); "
+            "maker>0: base * growth * scaleIfHip3 * (1-referral); "
+            "maker rebate: base * growth * aligned((1-share)*1.5+share)"
+        ),
+    }
+    return rate, inputs
 
 
 class Settings(BaseSettings):
@@ -74,6 +148,8 @@ class Settings(BaseSettings):
     min_active_days: int = 14
     max_profit_concentration: Decimal = Decimal("0.50")
     allow_profit_concentration_override: bool = False
+    min_copyability_observations: int = 10
+    supported_collateral_tokens: str = "0"
 
     weight_profitability: Decimal = Decimal("0.20")
     weight_profit_factor: Decimal = Decimal("0.15")
@@ -131,7 +207,7 @@ class Settings(BaseSettings):
         if text not in ("paper", "testnet"):
             raise ValueError(
                 "execution_mode must be 'paper' or 'testnet'. "
-                "Mainnet trading is disabled in v0.1 and there is no mainnet execution path."
+                "Mainnet trading is disabled in v0.1.1 and there is no mainnet execution path."
             )
         return text
 
@@ -183,27 +259,47 @@ class Settings(BaseSettings):
 
         return redact(self.model_dump(mode="json"))
 
-    def fee_for(self, *, dex: str, growth_mode: str | None, role: str) -> tuple[Decimal, str]:
-        """Conservative fee assumption. Account-specific discounts are not known.
+    def supported_collateral(self) -> frozenset[int]:
+        out: set[int] = set()
+        for part in self.supported_collateral_tokens.split(","):
+            part = part.strip()
+            if part:
+                out.add(int(part))
+        return frozenset(out or {0})
 
-        Core tier-0 (no volume/staking/referral discount): taker 0.045%, maker 0.015%.
-        HIP-3 growth mode: top of the published all-in taker band, 0.009%.
-        HIP-3 otherwise: 4x protocol tier-0, covering an unknown deployer fee share
-        up to the documented 300% additional share. This is an assumption, stored
-        on every simulated fill.
+    def fee_for(
+        self,
+        *,
+        dex: str,
+        growth_mode: str | None,
+        role: str,
+        deployer_fee_scale: Decimal | str | None = None,
+        aligned_quote: bool = False,
+        referral_discount: Decimal = Decimal(0),
+    ) -> tuple[Decimal | None, str, dict[str, Any]]:
+        """Tier-0 base rate times the official HIP-3 multiplier.
+
+        Returns (rate, label, inputs). rate is None when a HIP-3 market has no
+        deployerFeeScale. The inputs dict is what a simulated fill must store.
         """
-        taker = role == "taker"
-        if dex in ("", "core"):
-            if taker:
-                return self.fee_taker_rate, "configured_tier0_taker_no_discounts"
-            return self.fee_maker_rate, "configured_tier0_maker_no_discounts"
-        if (growth_mode or "").lower() == "enabled":
-            if taker:
-                return self.fee_hip3_growth_taker_rate, "configured_hip3_growth_taker_upper_band"
-            return self.fee_hip3_growth_maker_rate, "configured_hip3_growth_maker_assumption"
-        if taker:
-            return self.fee_hip3_standard_taker_rate, "configured_hip3_nongrowth_4x_protocol_taker"
-        return self.fee_hip3_standard_maker_rate, "configured_hip3_nongrowth_4x_protocol_maker"
+        hip3 = dex not in ("", "core")
+        growth = str(growth_mode or "").lower() == "enabled"
+        base = self.fee_taker_rate if role == "taker" else self.fee_maker_rate
+        scale = None if deployer_fee_scale in (None, "") else D(deployer_fee_scale)
+        rate, inputs = official_perp_fee(
+            base_rate=base,
+            role=role,
+            deployer_fee_scale=scale,
+            growth_mode=growth,
+            referral_discount=referral_discount,
+            aligned_quote=aligned_quote,
+            hip3=hip3,
+        )
+        if rate is None:
+            return None, "hip3_fee_scale_unknown", inputs
+        label = f"official_{'hip3' if hip3 else 'core'}_{role}_{'growth' if growth else 'base'}"
+        inputs["label"] = label
+        return rate, label, inputs
 
 
 def score_weights(settings: Settings) -> dict[str, Decimal]:

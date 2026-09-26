@@ -88,6 +88,76 @@ def _herfindahl(notionals: list[Decimal]) -> Decimal:
     return sum((n / total) ** 2 for n in notionals)
 
 
+def _return_drawdown(closed: list[Episode]) -> Decimal:
+    """Peak-to-trough drawdown of a normalized equity curve that starts at 1.
+
+    Each closed episode multiplies equity by (1 + closed_pnl / entry_notional).
+    The starting basis is 1, so the denominator is never zero. Episodes with no
+    entry notional are skipped rather than invented.
+    """
+    ordered = sorted(closed, key=lambda ep: (ep.exit_time_ms or 0, ep.entry_time_ms))
+    equity = Decimal(1)
+    peak = Decimal(1)
+    max_dd = Decimal(0)
+    for ep in ordered:
+        if ep.entry_notional <= 0:
+            continue
+        equity = equity * (Decimal(1) + ep.closed_pnl / ep.entry_notional)
+        if equity > peak:
+            peak = equity
+        if peak > 0:
+            dd = (peak - equity) / peak
+            if dd > max_dd:
+                max_dd = dd
+    return max_dd
+
+
+def _account_value_drawdown(values: list[Decimal]) -> Decimal | None:
+    if len(values) < 2 or values[0] <= 0:
+        return None
+    peak = values[0]
+    max_dd = Decimal(0)
+    for value in values:
+        if value > peak:
+            peak = value
+        if peak > 0:
+            dd = (peak - value) / peak
+            if dd > max_dd:
+                max_dd = dd
+    return max_dd
+
+
+def _normalized_return(
+    closed: list[Episode],
+    account_values: list[Decimal] | None,
+    account_pnl: list[Decimal] | None,
+) -> Decimal:
+    """Size-normalized performance. Raw USD PnL is not this number.
+
+    Prefer Hyperliquid account history when it is usable: the change in
+    reported pnl divided by the average account value, which requires at least
+    two strictly positive account-value points and two pnl points. Otherwise
+    use sum(episode closed_pnl) / sum(episode entry_notional) over closed
+    episodes that have a positive entry notional. Equal percentage results
+    therefore score the same regardless of account size.
+    """
+    if account_values and account_pnl and len(account_values) >= 2 and len(account_pnl) >= 2:
+        if all(value > 0 for value in account_values):
+            average = sum(account_values, Decimal(0)) / Decimal(len(account_values))
+            if average > 0:
+                return (account_pnl[-1] - account_pnl[0]) / average
+    numerator = Decimal(0)
+    denominator = Decimal(0)
+    for ep in closed:
+        if ep.entry_notional <= 0:
+            continue
+        numerator += ep.closed_pnl
+        denominator += ep.entry_notional
+    if denominator <= 0:
+        return Decimal(0)
+    return numerator / denominator
+
+
 def _p90(values: list[Decimal]) -> Decimal:
     if not values:
         return Decimal(0)
@@ -105,6 +175,10 @@ def compute_metrics(
     copyability: Decimal | None,
     completeness_label: str,
     requested_window_fully_returned: bool,
+    copyability_observations: int = 0,
+    unmatched_closes: int = 0,
+    account_values: list[Decimal] | None = None,
+    account_pnl: list[Decimal] | None = None,
 ) -> Metrics:
     closed = [ep for ep in episodes if ep.closed]
     pnls = [ep.closed_pnl for ep in closed]
@@ -126,21 +200,18 @@ def compute_metrics(
             returns.append(ep.closed_pnl / ep.entry_notional)
         if ep.exit_time_ms is not None:
             holds.append(Decimal(max(0, ep.exit_time_ms - ep.entry_time_ms)) / Decimal(1000))
-    equity = Decimal(0)
-    peak = Decimal(0)
-    max_dd = Decimal(0)
+    equity_usd = Decimal(0)
+    peak_usd = Decimal(0)
     max_dd_usd = Decimal(0)
     for pnl in pnls:
-        equity += pnl
-        if equity > peak:
-            peak = equity
-        dd_usd = peak - equity
+        equity_usd += pnl
+        if equity_usd > peak_usd:
+            peak_usd = equity_usd
+        dd_usd = peak_usd - equity_usd
         if dd_usd > max_dd_usd:
             max_dd_usd = dd_usd
-        if peak > 0:
-            dd = dd_usd / peak
-            if dd > max_dd:
-                max_dd = dd
+    account_dd = _account_value_drawdown(list(account_values or []))
+    max_dd = account_dd if account_dd is not None else _return_drawdown(closed)
     day_pnl: dict[str, Decimal] = {}
     week_pnl: dict[str, Decimal] = {}
     active_days: set[str] = set()
@@ -189,6 +260,9 @@ def compute_metrics(
         completeness = Decimal(1)
     hl_sum = sum((f.closed_pnl for f in fills), Decimal(0))
     realized = sum(pnls, Decimal(0))
+    reconstructed = sum((ep.closed_pnl for ep in episodes), Decimal(0))
+    reconciled = unmatched_closes == 0 and abs(reconstructed - hl_sum) <= Decimal("0.00000001")
+    normalized = _normalized_return(closed, account_values, account_pnl)
     return Metrics(
         realized_pnl=realized,
         hyperliquid_closed_pnl=hl_sum,
@@ -231,7 +305,12 @@ def compute_metrics(
         completeness_label=completeness_label,
         copyability=copyability,
         copyability_known=copyability is not None,
-        unmatched_closes=0,
+        copyability_observations=int(copyability_observations),
+        unmatched_closes=int(unmatched_closes),
+        normalized_return=normalized,
+        reconstructed_net_pnl=reconstructed,
+        pnl_reconciled=reconciled,
+        data_quality_degraded=not reconciled,
     )
 
 
@@ -248,7 +327,7 @@ def metrics_to_dict(metrics: Metrics) -> dict[str, Any]:
 
 def _component_value(metrics: Metrics, name: str) -> Decimal | None:
     if name == "profitability":
-        return metrics.realized_pnl
+        return metrics.normalized_return
     if name == "profit_factor":
         return metrics.profit_factor
     if name == "consistency":
@@ -289,6 +368,8 @@ def verify_wallet(
         reasons.append("PROFIT_CONCENTRATION")
     if metrics.lifetime_complete:
         reasons.append("COMPLETENESS_MISLABELLED")
+    if not metrics.pnl_reconciled:
+        reasons.append("PNL_NOT_RECONCILED")
     return (len(reasons) == 0), reasons
 
 
@@ -300,6 +381,7 @@ def score_population(
     min_active_days: int,
     max_profit_concentration: Decimal,
     allow_concentration_override: bool,
+    min_copyability_observations: int = 10,
 ) -> dict[str, ScoreBreakdown]:
     populations: dict[str, list[Decimal]] = {name: [] for name in weights}
     values: dict[str, dict[str, Decimal | None]] = {}
@@ -337,18 +419,36 @@ def score_population(
                 "weighted": format(pct * weight, "f"),
             }
         score = (weighted / used_weight) if used_weight > 0 else Decimal(0)
-        verified, reasons = verify_wallet(
+        performance, reasons = verify_wallet(
             metrics,
             min_closed_trades=min_closed_trades,
             min_active_days=min_active_days,
             max_profit_concentration=max_profit_concentration,
             allow_concentration_override=allow_concentration_override,
         )
+        copy_reasons = list(reasons)
+        enough_copy = (
+            metrics.copyability_known
+            and metrics.copyability_observations >= min_copyability_observations
+        )
+        if not enough_copy:
+            copy_reasons.append("MIN_COPYABILITY_OBSERVATIONS")
+        copy_ok = performance and enough_copy
+        if copy_ok:
+            stage = "copy"
+        elif performance:
+            stage = "performance"
+        else:
+            stage = "none"
         out[address] = ScoreBreakdown(
             score=score,
             components=components,
             omitted=omitted,
-            verified=verified,
+            verified=performance,
             verification_reasons=reasons,
+            performance_verified=performance,
+            copy_verified=copy_ok,
+            verification_stage=stage,
+            copy_reasons=copy_reasons,
         )
     return out

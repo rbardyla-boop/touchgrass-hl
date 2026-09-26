@@ -9,7 +9,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from touchgrass_hl.db.repo import save_copy_obs, store_wallet_fills
+from touchgrass_hl.db.repo import save_copy_obs, store_wallet_fills, wallet_fill_key
 from touchgrass_hl.db.schema import TradeRow, WalletFillRow
 from touchgrass_hl.hyperliquid_client import HyperliquidREST, parse_user_fill
 from touchgrass_hl.logging_setup import log
@@ -51,9 +51,12 @@ async def download_fills(
             break
         for raw in batch:
             parsed = parse_user_fill(raw, coin_to_market)
-            if parsed is None or parsed["tid"] in seen:
+            if parsed is None:
                 continue
-            seen.add(parsed["tid"])
+            key = wallet_fill_key(int(parsed["time_ms"]), str(parsed["coin"]), str(parsed["tid"]))
+            if key in seen:
+                continue
+            seen.add(key)
             fills.append(parsed)
         last_time = max(stamped)
         if len(batch) < API_PAGE:

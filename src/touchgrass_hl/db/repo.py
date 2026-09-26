@@ -18,6 +18,7 @@ from touchgrass_hl.db.schema import (
     HydrationJob,
     JevReviewRow,
     LaneDecisionRow,
+    MarketRow,
     MetricRow,
     PaperAccountRow,
     PaperFillRow,
@@ -203,12 +204,17 @@ def reset_running_jobs(session: Session) -> int:
     return int(result.rowcount or 0)
 
 
+def wallet_fill_key(time_ms: int, coin: str, tid: str) -> str:
+    return f"{int(time_ms)}|{coin}|{tid}"
+
+
 def store_wallet_fills(session: Session, address: str, fills: list[dict[str, Any]]) -> int:
     added = 0
     for fill in fills:
+        key = wallet_fill_key(int(fill["time_ms"]), str(fill["coin"]), str(fill["tid"]))
         exists = session.scalar(
             select(WalletFillRow.id).where(
-                WalletFillRow.address == address, WalletFillRow.tid == fill["tid"]
+                WalletFillRow.address == address, WalletFillRow.fill_key == key
             )
         )
         if exists is not None:
@@ -233,6 +239,7 @@ def store_wallet_fills(session: Session, address: str, fills: list[dict[str, Any
                 hash=str(fill.get("hash") or ""),
                 crossed=None if crossed is None else (1 if crossed else 0),
                 raw_json=dumps(fill.get("raw") or {}),
+                fill_key=key,
             )
         )
         added += 1
@@ -261,7 +268,12 @@ def save_score(
     verified: bool,
     breakdown_json: str,
     now_ms: int,
+    *,
+    performance_verified: bool = False,
+    verification_stage: str = "none",
+    copy_observations: int = 0,
 ) -> None:
+    """`verified` is COPY_VERIFIED. Performance-only wallets stay monitored."""
     session.add(MetricRow(address=address, computed_ms=now_ms, metrics_json=metrics_json))
     session.add(
         ScoreRow(
@@ -275,7 +287,10 @@ def save_score(
     wallet = session.get(WalletRow, address)
     if wallet is not None:
         wallet.verified = verified
-        wallet.tracked = verified
+        wallet.performance_verified = performance_verified
+        wallet.verification_stage = verification_stage
+        wallet.copy_observations = int(copy_observations)
+        wallet.tracked = bool(performance_verified or verified)
         wallet.updated_ms = now_ms
 
 
@@ -303,7 +318,26 @@ def current_group_map(session: Session) -> dict[str, str]:
 
 
 def verified_addresses(session: Session) -> set[str]:
+    """COPY_VERIFIED wallets. These are the only cluster participants."""
     return set(session.scalars(select(WalletRow.address).where(WalletRow.verified.is_(True))).all())
+
+
+def monitored_addresses(session: Session) -> set[str]:
+    """PERFORMANCE_VERIFIED and COPY_VERIFIED wallets. Still watched for evidence."""
+    return set(
+        session.scalars(
+            select(WalletRow.address).where(WalletRow.verification_stage.in_(("performance", "copy")))
+        ).all()
+    )
+
+
+def known_copyability_observations(session: Session, address: str) -> int:
+    value = session.scalar(
+        select(func.count())
+        .select_from(CopyabilityRow)
+        .where(CopyabilityRow.address == address, CopyabilityRow.status == "known")
+    )
+    return int(value or 0)
 
 
 def latest_scores(session: Session) -> dict[str, Decimal]:
@@ -520,6 +554,7 @@ def add_open_position(session: Session, pos: PaperPosition, book_json: str) -> i
             slippage_bps=None if pos.entry_slippage_bps is None else format(pos.entry_slippage_bps, "f"),
             time_ms=pos.opened_ms,
             book_json=book_json,
+            fee_inputs_json=dumps(pos.fee_inputs or {}),
         )
     )
     return int(row.id)
@@ -559,6 +594,7 @@ def mark_position_closed(session: Session, pos: PaperPosition, book_json: str) -
             slippage_bps=row.exit_slippage_bps,
             time_ms=pos.closed_ms or utc_now_ms(),
             book_json=book_json,
+            fee_inputs_json=dumps(pos.exit_fee_inputs or {}),
         )
     )
 
@@ -727,3 +763,112 @@ def _pos_from_row(row: PaperPositionRow) -> PaperPosition:
 
 def count_rows(session: Session, model) -> int:
     return int(session.scalar(select(func.count()).select_from(model)) or 0)
+
+
+def baseline_priority(session: Session, addresses: list[str], now_ms: int, fresh_ms: int = 900_000) -> list[str]:
+    """Live-but-stale wallets, then wallets with no baseline. The ring does the rest."""
+    wanted = set(addresses)
+    if not wanted:
+        return []
+    recent = set(
+        session.scalars(
+            select(WalletActionRow.address).where(
+                WalletActionRow.source == "live",
+                WalletActionRow.time_ms >= now_ms - 3_600_000,
+                WalletActionRow.address.in_(wanted),
+            )
+        ).all()
+    )
+    baselines: dict[str, int] = {}
+    rows = session.scalars(
+        select(TrackedPositionRow).where(
+            TrackedPositionRow.address.in_(wanted),
+            TrackedPositionRow.market_id.like("dexbaseline:%"),
+        )
+    ).all()
+    for row in rows:
+        baselines[row.address] = max(baselines.get(row.address, 0), int(row.baseline_time_ms or 0))
+    live_stale = sorted(addr for addr in recent if now_ms - baselines.get(addr, 0) > fresh_ms)
+    missing = sorted(addr for addr in wanted if addr not in baselines and addr not in live_stale)
+    return live_stale + missing
+
+
+def research_summary(session: Session, now_ms: int | None = None) -> dict[str, Any]:
+    now = utc_now_ms() if now_ms is None else now_ms
+    markets = list(session.scalars(select(MarketRow)).all())
+    tradable = [row for row in markets if not str(row.market_id).startswith("dexbaseline:")]
+    active = [row for row in tradable if row.status == "active" and not row.is_delisted]
+    hip3 = [row for row in active if row.dex not in ("", "core")]
+    scales: dict[str, int] = {}
+    collateral: dict[str, int] = {}
+    for row in active:
+        if row.dex in ("", "core"):
+            scale_key = "core"
+        else:
+            scale_key = "missing" if row.deployer_fee_scale in (None, "") else str(row.deployer_fee_scale)
+            growth = "growth" if str(row.growth_mode or "").lower() == "enabled" else "base"
+            scale_key = f"{scale_key}:{growth}"
+        scales[scale_key] = scales.get(scale_key, 0) + 1
+        token = "missing" if row.collateral_token is None else str(row.collateral_token)
+        collateral[token] = collateral.get(token, 0) + 1
+    copy_rows = list(session.scalars(select(WalletRow).where(WalletRow.verified.is_(True))).all())
+    copy_addresses = {row.address for row in copy_rows}
+    baseline_times: dict[str, int] = {}
+    if copy_addresses:
+        tracked = session.scalars(
+            select(TrackedPositionRow).where(
+                TrackedPositionRow.address.in_(copy_addresses),
+                TrackedPositionRow.market_id.like("dexbaseline:%"),
+            )
+        ).all()
+        for row in tracked:
+            baseline_times[row.address] = max(
+                baseline_times.get(row.address, 0), int(row.baseline_time_ms or 0)
+            )
+    ages = [now - ts for ts in baseline_times.values() if ts > 0]
+    vetoes: dict[str, int] = {}
+    for raw in session.scalars(select(RiskDecisionRow.vetoes_json)).all():
+        for code in loads(raw) or []:
+            vetoes[str(code)] = vetoes.get(str(code), 0) + 1
+    lanes = {}
+    for lane in LANES:
+        account = load_account(session, lane)
+        lanes[lane] = {
+            "cash": format(account.cash, "f"),
+            "peak_equity": format(account.peak_equity, "f"),
+            "realized_pnl": format(account.realized_pnl, "f"),
+            "open_positions": len(account.open_positions()),
+        }
+    hydrated = int(
+        session.scalar(
+            select(func.count()).select_from(WalletRow).where(WalletRow.hydration_status == "done")
+        )
+        or 0
+    )
+    performance = int(
+        session.scalar(
+            select(func.count())
+            .select_from(WalletRow)
+            .where(WalletRow.verification_stage == "performance")
+        )
+        or 0
+    )
+    return {
+        "markets_total": len(tradable),
+        "active_markets": len(active),
+        "active_hip3": len(hip3),
+        "fee_scale_distribution": scales,
+        "collateral_distribution": collateral,
+        "trades": count_rows(session, TradeRow),
+        "wallets": count_rows(session, WalletRow),
+        "hydrated_wallets": hydrated,
+        "performance_verified": performance,
+        "copy_verified": len(copy_addresses),
+        "baseline_coverage": f"{len(baseline_times)}/{len(copy_addresses)}",
+        "baseline_wallets": len(baseline_times),
+        "actionable_wallets": len(copy_addresses),
+        "oldest_baseline_age_ms": None if not ages else max(ages),
+        "candidates": count_rows(session, CandidateRow),
+        "hard_vetoes": vetoes,
+        "paper_lanes": lanes,
+    }

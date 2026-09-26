@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -59,6 +60,13 @@ def rows_from_meta(
         status = "delisted" if delisted else ("halted" if exchange_halted else "active")
         table_id = asset.get("marginTableId")
         table = margin_tables.get(int(table_id)) if table_id is not None else None
+        collateral = meta.get("collateralToken")
+        if collateral is None and not dex_name:
+            collateral = 0
+        scale = asset.get("deployerFeeScale")
+        last_change = asset.get("lastFeeScaleChangeTime")
+        if last_change is None:
+            last_change = asset.get("lastFeeScaleChangeTimeMs")
         hip3 = {
             "dex_meta": dex_meta,
             "growthMode": asset.get("growthMode"),
@@ -66,7 +74,9 @@ def rows_from_meta(
             "marginMode": asset.get("marginMode"),
             "onlyIsolated": asset.get("onlyIsolated"),
             "marginTable": table,
-            "collateralToken": meta.get("collateralToken"),
+            "collateralToken": collateral,
+            "deployerFeeScale": None if not dex_name else scale,
+            "lastFeeScaleChangeTime": last_change,
         }
         rows.append(
             {
@@ -80,6 +90,9 @@ def rows_from_meta(
                 "margin_mode": asset.get("marginMode"),
                 "only_isolated": bool(asset.get("onlyIsolated")),
                 "growth_mode": asset.get("growthMode"),
+                "deployer_fee_scale": None if not dex_name or scale is None else str(scale),
+                "last_fee_scale_change_ms": _fee_change_ms(last_change),
+                "collateral_token": int(collateral) if collateral is not None else None,
                 "is_delisted": delisted,
                 "mark_px": _s(ctx.get("markPx")),
                 "oracle_px": _s(ctx.get("oraclePx")),
@@ -102,6 +115,38 @@ def _s(value: Any) -> str | None:
     if value is None:
         return None
     return str(value)
+
+
+def _fee_change_ms(value: Any) -> int | None:
+    """Hyperliquid sends lastFeeScaleChangeTime as an ISO timestamp or a number."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value).strip()
+    if text.lstrip("-").isdigit():
+        return int(text)
+    cleaned = text.replace("Z", "+00:00")
+    if "." in cleaned:
+        head, tail = cleaned.split(".", 1)
+        digits = []
+        rest = ""
+        for index, char in enumerate(tail):
+            if char.isdigit():
+                digits.append(char)
+            else:
+                rest = tail[index:]
+                break
+        cleaned = head + "." + "".join(digits[:6]) + rest
+    try:
+        parsed = datetime.fromisoformat(cleaned)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return int(parsed.timestamp() * 1000)
 
 
 class MarketRegistry:
@@ -159,8 +204,26 @@ class MarketRegistry:
         dexs = dex_entries(await self.client.perp_dexs())
         collected: list[tuple[str, list[dict[str, Any]]]] = []
         for index, name, meta in dexs:
+            payload = None
+            for attempt in range(2):
+                try:
+                    payload = await self.client.meta_and_asset_ctxs(name)
+                    break
+                except Exception as exc:
+                    log(
+                        logger,
+                        logging.WARNING,
+                        "dex_refresh_failed",
+                        dex=name or "core",
+                        error=str(exc)[:300],
+                        attempt=attempt + 1,
+                    )
+                    if "429" not in str(exc) or attempt == 1:
+                        payload = None
+                        break
+            if payload is None:
+                continue
             try:
-                payload = await self.client.meta_and_asset_ctxs(name)
                 rows = rows_from_meta(
                     perp_dex_index=index,
                     dex_name=name,

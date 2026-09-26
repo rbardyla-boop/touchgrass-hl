@@ -67,13 +67,22 @@ class TradeCollector:
         verified: set[str],
         groups: dict[str, str],
         scores: dict[str, Decimal],
+        monitored: set[str] | None = None,
     ) -> list[dict]:
         trades = self.buffer
         ctxs = self.ctx_updates
         self.buffer = []
         self.ctx_updates = []
         try:
-            candidates = self._persist(session, trades, ctxs, verified=verified, groups=groups, scores=scores)
+            candidates = self._persist(
+                session,
+                trades,
+                ctxs,
+                verified=verified,
+                groups=groups,
+                scores=scores,
+                monitored=monitored,
+            )
         except Exception:
             self.buffer = trades + self.buffer
             self.ctx_updates = ctxs + self.ctx_updates
@@ -89,6 +98,7 @@ class TradeCollector:
         verified: set[str],
         groups: dict[str, str],
         scores: dict[str, Decimal],
+        monitored: set[str] | None = None,
     ) -> list[dict]:
         self._apply_full_ctx_snapshots(session, ctxs)
         added = insert_trades(session, trades)
@@ -101,11 +111,14 @@ class TradeCollector:
         self.inserted += added
         self.discovered_addresses += len({t.buyer for t in trades} | {t.seller for t in trades})
         candidates = []
-        if verified:
-            tracked = tracked_map(session, verified)
+        watch = set(verified if monitored is None else monitored) | set(verified)
+        if watch:
+            tracked = tracked_map(session, watch)
             for trade in trades:
                 candidates.extend(
-                    self._apply_participants(session, trade, tracked, verified, groups, scores)
+                    self._apply_participants(
+                        session, trade, tracked, verified, groups, scores, monitored=watch
+                    )
                 )
         if added or queued:
             log(
@@ -146,11 +159,13 @@ class TradeCollector:
         verified: set[str],
         groups: dict[str, str],
         scores: dict[str, Decimal],
+        monitored: set[str] | None = None,
     ) -> list[dict]:
         out = []
+        watch = verified if monitored is None else monitored
         dex, _coin = split_market_id(trade.market_id)
         for address, wallet_side in ((trade.buyer, "B"), (trade.seller, "A")):
-            if address not in verified:
+            if address not in watch:
                 continue
             row = tracked.get((address, trade.market_id))
             baseline = tracked.get((address, f"dexbaseline:{dex}"))
@@ -218,6 +233,8 @@ class TradeCollector:
                 event.direction = "LONG"
             elif action in {"OPEN_SHORT", "ADD_SHORT"}:
                 event.direction = "SHORT"
+            if address not in verified:
+                continue
             candidate = self.cluster.on_action(event, verified=verified, groups=groups, scores=scores)
             if candidate is not None:
                 out.append(candidate)
