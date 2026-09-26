@@ -1,0 +1,24 @@
+[Unit]
+Description=TOUCHGRASS-HL Hyperliquid research and paper-trading bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=touchgrass
+Group=touchgrass
+WorkingDirectory=/opt/touchgrass-hl
+EnvironmentFile=/opt/touchgrass-hl/.env
+ExecStart=/opt/touchgrass-hl/.venv/bin/touchgrass-hl run
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/touchgrass-hl/data /opt/touchgrass-hl/logs
+
+[Install]
+WantedBy=multi-user.target
